@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DISPLAY_NUM="${XPRA_DISPLAY:-:100}"
+SOCKET_DIR="${XPRA_SOCKET_DIR:-/xpra-host}"
+
+xpra stop \
+    --socket-dir="$SOCKET_DIR" \
+    "$DISPLAY_NUM"

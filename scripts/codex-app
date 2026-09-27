@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DISPLAY_NUM="${XPRA_DISPLAY:-:100}"
+SOCKET_DIR="${XPRA_SOCKET_DIR:-/xpra-host}"
+
+if [[ ! -d "$SOCKET_DIR" ]]; then
+    echo "Xpra socket directory does not exist:"
+    echo "  $SOCKET_DIR"
+    exit 1
+fi
+
+if [[ ! -w "$SOCKET_DIR" ]]; then
+    echo "Xpra socket directory is not writable:"
+    echo "  $SOCKET_DIR"
+    exit 1
+fi
+
+echo "Starting ChatGPT"
+echo "  Xpra display:      $DISPLAY_NUM"
+echo "  Xpra socket dir:   $SOCKET_DIR"
+echo
+
+xpra start "$DISPLAY_NUM" \
+    --daemon=yes \
+    --socket-dir="$SOCKET_DIR" \
+    --socket-permissions=600 \
+    --html=no \
+    --mdns=no \
+    --clipboard=no \
+    --notifications=no \
+    --printing=no \
+    --speaker=no \
+    --microphone=no \
+    --webcam=no \
+    --file-transfer=no \
+    --open-files=no \
+    --exit-with-children=yes \
+    --start-child="dbus-run-session -- /usr/local/bin/chatgpt-session"
+
+echo
+echo "ChatGPT started."
+echo
+echo "Attach from the host using:"
+echo
+echo "  ./attach.sh"
+echo
