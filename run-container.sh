@@ -46,6 +46,9 @@ exec podman run --rm -it \
     --name "$CONTAINER_NAME" \
     --hostname "$CONTAINER_NAME" \
     --userns=keep-id \
+    --read-only \
+    --read-only-tmpfs=true \
+    --security-opt=no-new-privileges \
     --shm-size=1g \
     --pids-limit=2048 \
     -e XPRA_DISPLAY=:100 \
@@ -55,6 +58,3 @@ exec podman run --rm -it \
     -v "${SOCKET_DIR}:/xpra-host:rw" \
     -w /workspace \
     "$IMAGE"
-
-
-

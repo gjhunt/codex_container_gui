@@ -27,7 +27,8 @@ xpra start "$DISPLAY_NUM" \
     --socket-permissions=600 \
     --html=no \
     --mdns=no \
-    --clipboard=no \
+    --clipboard=yes \
+    --clipboard-direction=to-client \
     --notifications=no \
     --printing=no \
     --speaker=no \

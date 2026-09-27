@@ -44,7 +44,8 @@ echo "Attaching to:"
 echo "  $SOCKET"
 
 exec xpra attach "$SOCKET" \
-    --clipboard=no \
+     --clipboard=yes \
+     --clipboard-direction=to-client \
     --notifications=no \
     --printing=no \
     --speaker=no \
