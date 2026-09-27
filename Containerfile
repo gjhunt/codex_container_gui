@@ -5,6 +5,7 @@ ARG UID=1000
 ARG GID=1000
 
 ARG CHATGPT_DEB_URL="https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb"
+ARG CHATGPT_DEB_SHA256=""
 ARG CODEX_VERSION=latest
 
 
@@ -49,6 +50,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -fL \
         "${CHATGPT_DEB_URL}" \
         -o /tmp/chatgpt.deb \
+    && if [ -n "${CHATGPT_DEB_SHA256}" ]; then \
+        echo "${CHATGPT_DEB_SHA256}  /tmp/chatgpt.deb" | sha256sum -c -; \
+    fi \
     && apt-get update \
     && apt-get install -y --no-install-recommends /tmp/chatgpt.deb \
     && rm -f /tmp/chatgpt.deb \

@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM_NAME="$(basename "$0")"
+IMAGE="${IMAGE:-chatgpt-xpra}"
+INSTANCE="${INSTANCE:-default}"
+CLIPBOARD_DIRECTION="${XPRA_CLIPBOARD_DIRECTION:-to-client}"
+
+case "$PROGRAM_NAME" in
+    chatgpt-start)  DEFAULT_COMMAND=start ;;
+    chatgpt-shell)  DEFAULT_COMMAND=shell ;;
+    chatgpt-attach) DEFAULT_COMMAND=attach ;;
+    chatgpt-stop)   DEFAULT_COMMAND=stop ;;
+    chatgpt-status) DEFAULT_COMMAND=status ;;
+    chatgpt-clean)  DEFAULT_COMMAND=clean ;;
+    *)              DEFAULT_COMMAND="" ;;
+esac
+
+usage() {
+    cat <<'EOF'
+Usage:
+  chatgpt-xpra [options] <command> [project]
+  chatgpt-{start,shell,attach,stop,status,clean} [options] [project]
+
+Commands:
+  start [project]  Start ChatGPT for a project and attach to its GUI
+  shell [project]  Open a shell in the container for a project
+  attach           Attach to an already-running ChatGPT GUI
+  stop             Stop the container for this instance
+  status           Show the container and Xpra socket state
+  clean            Remove stale Xpra sockets (only when stopped)
+  help             Show this help
+
+Options:
+  -i, --instance NAME   Select an independent instance (default: default)
+  --image IMAGE         Select the container image (default: chatgpt-xpra)
+  -h, --help            Show this help
+
+Environment:
+  INSTANCE                  Same as --instance
+  IMAGE                     Same as --image
+  XPRA_CLIPBOARD_DIRECTION  to-client, to-server, or both
+
+The project defaults to the current directory. The default clipboard setting,
+"to-client", permits copying from ChatGPT to the host but not host-to-app paste.
+EOF
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command '$1' was not found in PATH."
+}
+
+validate_settings() {
+    if [[ ! "$INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        die "Instance names must start with a letter or number and contain only letters, numbers, '.', '_', or '-'."
+    fi
+
+    case "$CLIPBOARD_DIRECTION" in
+        to-client|to-server|both) ;;
+        *) die "XPRA_CLIPBOARD_DIRECTION must be 'to-client', 'to-server', or 'both'." ;;
+    esac
+}
+
+require_runtime_dir() {
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        die "XDG_RUNTIME_DIR is not set. Log in through a normal desktop session or set it to your user runtime directory."
+    fi
+    if [[ ! -d "$XDG_RUNTIME_DIR" ]]; then
+        die "XDG_RUNTIME_DIR does not exist: $XDG_RUNTIME_DIR"
+    fi
+    if [[ ! -w "$XDG_RUNTIME_DIR" ]]; then
+        die "XDG_RUNTIME_DIR is not writable: $XDG_RUNTIME_DIR"
+    fi
+}
+
+set_names() {
+    CONTAINER_NAME="chatgpt-gui-${INSTANCE}"
+    if [[ "$INSTANCE" == default ]]; then
+        HOME_VOLUME="chatgpt-home"
+    else
+        HOME_VOLUME="chatgpt-home-${INSTANCE}"
+    fi
+    SOCKET_DIR="${XDG_RUNTIME_DIR}/chatgpt-xpra-${INSTANCE}"
+}
+
+container_exists() {
+    podman container exists "$CONTAINER_NAME" >/dev/null 2>&1
+}
+
+container_running() {
+    [[ "$(podman inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == true ]]
+}
+
+find_sockets() {
+    SOCKETS=()
+    if [[ -d "$SOCKET_DIR" ]]; then
+        mapfile -t SOCKETS < <(
+            find "$SOCKET_DIR" -maxdepth 1 -type s -name '*-100' -print
+        )
+    fi
+}
+
+clean_socket_dir() {
+    case "$SOCKET_DIR" in
+        "$XDG_RUNTIME_DIR"/chatgpt-xpra-*) ;;
+        *) die "Refusing to remove unexpected socket path: $SOCKET_DIR" ;;
+    esac
+    rm -rf -- "$SOCKET_DIR"
+}
+
+prepare_socket_dir() {
+    clean_socket_dir
+    mkdir -p "$SOCKET_DIR"
+    chmod 700 "$SOCKET_DIR"
+}
+
+resolve_project() {
+    require_command realpath
+    PROJECT_INPUT="${1:-$PWD}"
+    if ! PROJECT="$(realpath "$PROJECT_INPUT" 2>/dev/null)"; then
+        die "Project directory does not exist: $PROJECT_INPUT"
+    fi
+    [[ -d "$PROJECT" ]] || die "Project directory does not exist: $PROJECT_INPUT"
+}
+
+ensure_image() {
+    if ! podman image exists "$IMAGE" >/dev/null 2>&1; then
+        die "Container image '$IMAGE' was not found. Build it from the repository with 'make build'."
+    fi
+}
+
+ensure_home_volume() {
+    if ! podman volume inspect "$HOME_VOLUME" >/dev/null 2>&1; then
+        podman volume create "$HOME_VOLUME" >/dev/null
+    fi
+}
+
+podman_base_args() {
+    PODMAN_ARGS=(
+        --name "$CONTAINER_NAME"
+        --hostname "$CONTAINER_NAME"
+        --userns=keep-id
+        --read-only
+        --read-only-tmpfs=true
+        --security-opt=no-new-privileges
+        --shm-size=1g
+        --pids-limit=2048
+        -e XPRA_DISPLAY=:100
+        -e XPRA_SOCKET_DIR=/xpra-host
+        -e "XPRA_CLIPBOARD_DIRECTION=$CLIPBOARD_DIRECTION"
+        -v "${HOME_VOLUME}:/home/chatgpt:U"
+        -v "${PROJECT}:/workspace:rw"
+        -v "${SOCKET_DIR}:/xpra-host:rw"
+        -w /workspace
+    )
+}
+
+print_configuration() {
+    printf 'Container:     %s\n' "$CONTAINER_NAME"
+    printf 'Project:       %s\n' "$PROJECT"
+    printf 'Home volume:   %s\n' "$HOME_VOLUME"
+    printf 'Xpra socket:   %s\n' "$SOCKET_DIR"
+    printf 'Clipboard:     %s\n' "$CLIPBOARD_DIRECTION"
+}
+
+attach_session() {
+    require_command xpra
+    find_sockets
+
+    if (( ${#SOCKETS[@]} == 0 )); then
+        die "No Xpra socket found in $SOCKET_DIR. Start the app with 'chatgpt-start'."
+    fi
+    if (( ${#SOCKETS[@]} > 1 )); then
+        printf 'Multiple Xpra sockets found:\n' >&2
+        printf '  %s\n' "${SOCKETS[@]}" >&2
+        die "Refusing to guess which session to attach to."
+    fi
+
+    printf 'Attaching to %s\n' "${SOCKETS[0]}"
+    exec xpra attach "${SOCKETS[0]}" \
+        --clipboard=yes \
+        --clipboard-direction="$CLIPBOARD_DIRECTION" \
+        --notifications=no \
+        --printing=no \
+        --speaker=no \
+        --microphone=no \
+        --webcam=no \
+        --file-transfer=no \
+        --open-files=no
+}
+
+command_start() {
+    (( $# <= 1 )) || die "start accepts at most one project path."
+    require_command podman
+    require_command xpra
+
+    if container_running; then
+        printf 'Instance %s is already running; attaching to it.\n' "$INSTANCE"
+        attach_session
+    fi
+    if container_exists; then
+        printf 'Removing stopped container %s from the previous session.\n' "$CONTAINER_NAME"
+        podman rm "$CONTAINER_NAME" >/dev/null
+    fi
+
+    resolve_project "${1:-}"
+    ensure_image
+    prepare_socket_dir
+    ensure_home_volume
+    podman_base_args
+    print_configuration
+
+    # this is the command to actuallys start podman
+    CONTAINER_ID="$(podman run -d "${PODMAN_ARGS[@]}" "$IMAGE" codex-app --foreground)"
+    printf 'Started container %s. Waiting for ChatGPT…\n' "$CONTAINER_ID"
+
+    for _ in {1..200}; do
+        find_sockets
+        if (( ${#SOCKETS[@]} > 0 )); then
+            attach_session
+        fi
+        if ! container_running; then
+            printf 'The container exited before the GUI became available. Recent logs:\n' >&2
+            podman logs "$CONTAINER_ID" >&2 || true
+            exit 1
+        fi
+        sleep 0.1
+    done
+
+    printf 'Timed out waiting for the Xpra socket. Recent logs:\n' >&2
+    podman logs "$CONTAINER_ID" >&2 || true
+    exit 1
+}
+
+command_shell() {
+    (( $# <= 1 )) || die "shell accepts at most one project path."
+    require_command podman
+    resolve_project "${1:-}"
+    ensure_image
+
+    if container_running; then
+        die "Container '$CONTAINER_NAME' already exists. Use another --instance or stop the existing one."
+    fi
+    if container_exists; then
+        printf 'Removing stopped container %s from the previous session.\n' "$CONTAINER_NAME"
+        podman rm "$CONTAINER_NAME" >/dev/null
+    fi
+
+    prepare_socket_dir
+    ensure_home_volume
+    podman_base_args
+    print_configuration
+    exec podman run --rm -it "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash
+}
+
+command_attach() {
+    (( $# == 0 )) || die "attach does not accept positional arguments."
+    attach_session
+}
+
+command_stop() {
+    (( $# == 0 )) || die "stop does not accept positional arguments."
+    require_command podman
+    if container_running; then
+        printf 'Stopping %s…\n' "$CONTAINER_NAME"
+        podman stop --time 10 "$CONTAINER_NAME" >/dev/null
+    fi
+    if container_exists; then
+        printf 'Removing container %s…\n' "$CONTAINER_NAME"
+        podman rm "$CONTAINER_NAME" >/dev/null
+    else
+        printf 'Container %s is absent.\n' "$CONTAINER_NAME"
+    fi
+    clean_socket_dir
+}
+
+command_status() {
+    (( $# == 0 )) || die "status does not accept positional arguments."
+    require_command podman
+    if container_running; then
+        printf 'Container: running (%s)\n' "$CONTAINER_NAME"
+    elif container_exists; then
+        printf 'Container: stopped (%s)\n' "$CONTAINER_NAME"
+    else
+        printf 'Container: absent (%s)\n' "$CONTAINER_NAME"
+    fi
+
+    find_sockets
+    if (( ${#SOCKETS[@]} == 0 )); then
+        printf 'Xpra socket: absent (%s)\n' "$SOCKET_DIR"
+    else
+        printf 'Xpra socket: %s\n' "${SOCKETS[0]}"
+    fi
+}
+
+command_clean() {
+    (( $# == 0 )) || die "clean does not accept positional arguments."
+    if command -v podman >/dev/null 2>&1 && container_running; then
+        die "Instance '$INSTANCE' is running. Stop it before cleaning its socket directory."
+    fi
+    clean_socket_dir
+    printf 'Removed stale socket directory %s\n' "$SOCKET_DIR"
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+        -i|--instance)
+            (( $# >= 2 )) || die "$1 requires a value."
+            INSTANCE="$2"
+            shift 2
+            ;;
+        --image)
+            (( $# >= 2 )) || die "$1 requires a value."
+            IMAGE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ -n "$DEFAULT_COMMAND" ]]; then
+    COMMAND="$DEFAULT_COMMAND"
+else
+    COMMAND="${1:-help}"
+    if (( $# > 0 )); then
+        shift
+    fi
+fi
+
+if [[ "$COMMAND" == help ]]; then
+    usage
+    exit 0
+fi
+
+case "$COMMAND" in
+    start|shell|attach|stop|status|clean) ;;
+    *)
+        usage >&2
+        die "Unknown command: $COMMAND"
+        ;;
+esac
+
+validate_settings
+require_runtime_dir
+set_names
+
+case "$COMMAND" in
+    start)  command_start "$@" ;;
+    shell)  command_shell "$@" ;;
+    attach) command_attach "$@" ;;
+    stop)   command_stop "$@" ;;
+    status) command_status "$@" ;;
+    clean)  command_clean "$@" ;;
+esac

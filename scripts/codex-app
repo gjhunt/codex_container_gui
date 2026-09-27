@@ -3,6 +3,32 @@ set -euo pipefail
 
 DISPLAY_NUM="${XPRA_DISPLAY:-:100}"
 SOCKET_DIR="${XPRA_SOCKET_DIR:-/xpra-host}"
+CLIPBOARD_DIRECTION="${XPRA_CLIPBOARD_DIRECTION:-to-client}"
+DAEMON_MODE=yes
+
+case "${1:-}" in
+    --foreground)
+        DAEMON_MODE=no
+        shift
+        ;;
+    -h|--help)
+        echo "Usage: codex-app [--foreground]"
+        exit 0
+        ;;
+    "") ;;
+    *)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
+esac
+
+case "$CLIPBOARD_DIRECTION" in
+    to-client|to-server|both) ;;
+    *)
+        echo "XPRA_CLIPBOARD_DIRECTION must be 'to-client', 'to-server', or 'both'." >&2
+        exit 1
+        ;;
+esac
 
 if [[ ! -d "$SOCKET_DIR" ]]; then
     echo "Xpra socket directory does not exist:"
@@ -19,30 +45,41 @@ fi
 echo "Starting ChatGPT"
 echo "  Xpra display:      $DISPLAY_NUM"
 echo "  Xpra socket dir:   $SOCKET_DIR"
+echo "  Clipboard:         $CLIPBOARD_DIRECTION"
 echo
 
-xpra start "$DISPLAY_NUM" \
-    --daemon=yes \
-    --socket-dir="$SOCKET_DIR" \
-    --socket-permissions=600 \
-    --html=no \
-    --mdns=no \
-    --clipboard=yes \
-    --clipboard-direction=to-client \
-    --notifications=no \
-    --printing=no \
-    --speaker=no \
-    --microphone=no \
-    --webcam=no \
-    --file-transfer=no \
-    --open-files=no \
-    --exit-with-children=yes \
+XPRA_ARGS=(
+    start "$DISPLAY_NUM"
+    --daemon="$DAEMON_MODE"
+    --socket-dir="$SOCKET_DIR"
+    --socket-permissions=600
+    --html=no
+    --mdns=no
+    --clipboard=yes
+    --clipboard-direction="$CLIPBOARD_DIRECTION"
+    --notifications=no
+    --printing=no
+    --speaker=no
+    --microphone=no
+    --webcam=no
+    --file-transfer=no
+    --open-files=no
+    --exit-with-children=yes
     --start-child="dbus-run-session -- /usr/local/bin/chatgpt-session"
+)
+
+if [[ "$DAEMON_MODE" == no ]]; then
+    echo "ChatGPT is starting. Attach from the host with chatgpt-attach."
+    echo
+    exec xpra "${XPRA_ARGS[@]}"
+fi
+
+xpra "${XPRA_ARGS[@]}"
 
 echo
 echo "ChatGPT started."
 echo
 echo "Attach from the host using:"
 echo
-echo "  ./attach.sh"
+echo "  chatgpt-attach"
 echo
